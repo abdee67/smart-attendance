@@ -105,7 +105,6 @@ static Future<Float32List> getFaceEmbedding(String imagePath) async {
       embedding.map((v) => v / length).toList()
     );
   }
-
   
   static bool verifyFace(Float32List storedEmbedding, Float32List currentEmbedding) {
     if (storedEmbedding.length != 128 || currentEmbedding.length != 128) {
