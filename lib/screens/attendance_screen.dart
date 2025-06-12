@@ -40,7 +40,6 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   }
 
   Future<void> _syncPendingRecords() async {
-    await apiservice.processPendingSyncs();
     await _loadPendingRecords();
   }
 
@@ -295,7 +294,7 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
             icon: const Icon(Icons.sync),
             onPressed: () async {
               try {
-                await apiservice.syncAttendance(record);
+                await apiservice.postAttendanceBatch([record]);
                 await _loadPendingRecords();
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(content: Text('Sync successful')),

@@ -38,7 +38,6 @@ void main() async {
   );
     Timer.periodic(const Duration(seconds: 15), (timer) async {
     final db = await AttendancedbMethods.instance.dbHelper.database;
-    await apiService.processPendingSyncs;
   });
 }
 

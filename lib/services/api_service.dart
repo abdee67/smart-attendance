@@ -2,8 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:intl/intl.dart';
 import 'package:smartattendance/services/AttendanceException.dart';
-import 'package:sqflite/sqflite.dart';
 
 import '/db/dbmethods.dart';
 import '/models/location.dart';
@@ -15,7 +15,7 @@ import '/screens/location_service.dart';
 
 
 class ApiService {
-  static const String baseUrl = 'https://2491-196-188-160-151.ngrok-free.app/savvy/api';
+  static const String baseUrl = 'https://bf0e-196-188-160-151.ngrok-free.app/savvy/api';
   final AttendancedbMethods db = AttendancedbMethods.instance;
   final Connectivity _connectivity = Connectivity();
     final http.Client _client;
@@ -57,7 +57,6 @@ Future<Map<String, dynamic>> authenticateUser(String username, String password) 
           'userMessage': 'System error: Please contact support'
         };
       }
-
     // Save location data to local DB
       final location = LocationData(
         id: 1, // Using fixed ID for primary location
@@ -66,8 +65,6 @@ Future<Map<String, dynamic>> authenticateUser(String username, String password) 
         longitude: longitude,
       );
       await db.saveLocationData(location);
-      
-
       // Store credentials securely for future logins
       await _storeCredentials(username, password, userId);
       
@@ -163,133 +160,117 @@ Future<Map<String, String>?> getStoredCredentials() async {
     return await _secureStorage.read(key: 'api_user_id');
   }
 
-   Future<void> markAttendance() async {
-    final userId = await getUserId();
-    if (userId == null) throw Exception('User not logged in');
-    
-    final locationValid = await LocationService().verifyLocation();
-    if (!locationValid) {
-      throw Exception('Location verification failed');
-    }
+Future<void> markAttendance() async {
+  final userId = await getUserId();
+  if (userId == null) throw Exception('User not logged in');
 
-    final record = AttendanceRecord(
-      userId: userId,
-      timestamp: DateTime.now(),
-      status: AttendanceStatus.absent,
-    );
+  // 1) verify location…
+  if (!await LocationService().verifyLocation()) {
+    throw Exception('Location verification failed');
+  }
 
-    final connectivityResult = await _connectivity.checkConnectivity();
-    if (connectivityResult != ConnectivityResult.none) {
-         try {
-        // Try to sync immediately
-        await syncAttendance(record);
-        record.status = AttendanceStatus.present;
-        await db.saveAttendance(record);
-      } catch (e) {
-        // Fallback to local storage if sync fails
-        record.status = AttendanceStatus.absent;
-        await db.saveAttendance(record);
-        throw AttendanceException('Online sync failed. Saved locally for later sync.');
-      }
-    } else {
-      // Save to local storage for later sync
+  // 2) build the record and attempt immediate online sync
+  final record = AttendanceRecord(
+    userId: userId,
+    timestamp: DateTime.now(),
+    status: AttendanceStatus.absent,
+  );
+
+  // ignore: unrelated_type_equality_checks
+  final isOnline = await _connectivity.checkConnectivity() != ConnectivityResult.none;
+  if (isOnline) {
+    // wrap in a list ⇒ batch API
+    final response = await postAttendanceBatch([record]);
+    if (response.statusCode == 200) {
+      // success ⇒ mark present
+      record.status = AttendanceStatus.present;
       await db.saveAttendance(record);
-      throw AttendanceException('No internet connection. Saved locally for later sync.');
+    } else {
+      // non‐200 ⇒ queue locally
+      await db.saveAttendance(record);
+      throw AttendanceException('Server rejected attendance: ${response.statusCode}');
     }
+  } else {
+    // offline ⇒ queue locally
+    await db.saveAttendance(record);
+    throw AttendanceException('No internet. Saved locally for later sync.');
   }
-    Future<void> syncAttendance(AttendanceRecord record) async {
-    try {
-      await postAttendanceStatus(record);
-    } catch (e) {
-      throw AttendanceException('Failed to sync attendance: ${e.toString()}');
-    }
-  }
-
-  Future<void> processPendingSyncs() async {
-    try {
-      // Check connectivity first
-      final connectivityResult = await _connectivity.checkConnectivity();
-      // ignore: unrelated_type_equality_checks
-      if (connectivityResult == ConnectivityResult.none) return;
-
-      // Get all pending syncs ordered by timestamp 
-      final pendingSyncs = await db.getPendingAttendances();
-
-       for (final record in pendingSyncs) {
-        try {
-          await syncAttendance(record);
-          await db.markAsSynced(record.id!);
-        } catch (e) {
-          debugPrint('Failed to sync record ${record.id}: $e');
-          // Update retry count and last attempt time
-        }
-      }
-        } catch (e) {
-          debugPrint('Failed to process pending sync: $e');
-        }
-  }
-
-
-  Future<http.Response> postAttendanceStatus(
-    AttendanceRecord data, {
-    int maxRetries = 3,
-  }) async {
-    final url = Uri.parse('$baseUrl/attendance/faceCompare');
-    http.Response? lastResponse;
-    Exception? lastException;
-
-    for (int i = 0; i < maxRetries; i++) {
-      try {
-        final response = await http.post(
-          url,
-          headers: _headers,
-          body: jsonEncode(data.tojson()),
-        ).timeout(const Duration(seconds: 50));
-
-        lastResponse = response;
-        
-        if (response.statusCode == 200) {
-          debugPrint('✅ Satus submitted successfully!');
-          return response;
-        } else {
-          debugPrint('❌ Failed to submit Satus');
-          debugPrint('Status: ${response.statusCode}');
-          debugPrint('Body: ${response.body}');
-          lastException = ApiException('API returned ${response.statusCode}', response.statusCode);
-        }
-
-        // Exponential backoff
-        if (i < maxRetries - 1) {
-          await Future.delayed(Duration(seconds: _calculateDelay(i)));
-        }
-      } on TimeoutException catch (e) {
-        lastException = e;
-        debugPrint('⏱️ Timeout occurred: ${e.message}');
-        if (i < maxRetries - 1) {
-          await Future.delayed(Duration(seconds: _calculateDelay(i)));
-        }
-      } on http.ClientException catch (e) {
-        lastException = e;
-        debugPrint('🌐 Network error occurred: ${e.message}');
-        if (i < maxRetries - 1) {
-          await Future.delayed(Duration(seconds: _calculateDelay(i)));
-        }
-      } catch (e) {
-        lastException = Exception('Unknown error: $e');
-        debugPrint('❌ Unexpected error: $e');
-        if (i < maxRetries - 1) {
-          await Future.delayed(Duration(seconds: _calculateDelay(i)));
-        }
-      }
-    }
-
-    if (lastResponse != null) return lastResponse;
-    throw lastException ?? ApiException('API request failed after $maxRetries attempts');
-  }
-  // Helper method to calculate exponential backoff delay
-  static int _calculateDelay(int attempt) => 2 * (attempt + 1);
 }
 
+  /// Sends one or more attendance records in a single batch.
+  /// Returns the raw http.Response so callers can decide what to do.
+Future<http.Response> postAttendanceBatch(
+  List<AttendanceRecord> records, {
+  int maxRetries = 3,
+}) async {
+  // 1) Build your payload exactly as the API expects (an array of objects)
+  final List<Map<String, dynamic>> payload = records.map((r) {
+    return {
+      "userId": r.userId, // Wrap userId in a nested object
+      "attendanceDate": DateFormat("yyyy-MM-dd'T'HH:mm:ss").format(r.timestamp),
+      "attendanceStatus": "pending",
+    };
+  }).toList();
+
+  final url = Uri.parse('$baseUrl/attendance/faceCompare');
+  final body = jsonEncode(payload);
+  http.Response? lastResponse;
+  Exception? lastError;
+
+    // 2) Retry loop with exponential backoff
+    for (var attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        final response = await _client
+            .post(url, headers: _headers, body: body)
+            .timeout(const Duration(seconds: 30));
+        lastResponse = response;
+        // 3) Immediately return on success
+        if (response.statusCode == 200) {
+          debugPrint('✅ Attendance batch submitted: ${response.body}');
+          return response;
+        }
+
+        // 4) Log & prepare to retry
+        debugPrint('❌ Attendance batch failed (${response.statusCode}) → ${response.body}');
+        lastError = ApiException('Status ${response.statusCode}', response.statusCode);
+      } on TimeoutException catch (e) {
+        lastError = e;
+        debugPrint('⏱️ Timeout on attendance post: $e');
+      } on http.ClientException catch (e) {
+        lastError = e;
+        debugPrint('🌐 Network error on attendance post: $e');
+      } catch (e) {
+        lastError = Exception('Unknown error: $e');
+        debugPrint('❌ Unexpected error on attendance post: $e');
+      }
+
+      // 5) Delay before next attempt (unless it was last)
+      if (attempt < maxRetries - 1) {
+        await Future.delayed(Duration(seconds: 2 * (attempt + 1)));
+      }
+    }
+
+    // if we have a non‐200 response, return it to caller
+    if (lastResponse != null) return lastResponse;
+
+    // else throw the last exception
+    throw lastError ?? ApiException('Attendance batch failed after $maxRetries tries');
+  }
+}
+
+Future<void> processPendingSyncs(apiService) async {
+  final Connectivity connectivity = Connectivity();
+  if (await connectivity.checkConnectivity() == ConnectivityResult.none) return;
+  final pending = await apiService.db.getPendingAttendances();
+  for (final record in pending) {
+    final response = await apiService.postAttendanceBatch([record]);
+    if (response.statusCode == 200) {
+      await apiService.db.markAsSynced(record.id!);
+    }
+  }
+}
+
+  // Helper method to calculate exponential backoff delay
 class ApiException implements Exception {
   final String message;
   final int? statusCode;
